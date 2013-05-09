@@ -30,23 +30,28 @@ import           System.Glib.MainLoop
 import           System.Glib.Properties
 import           System.Glib.Signals
 import           System.Random
+import           System.Log.Logger
 
-data Session = Session { sid   :: Text
-                       , peer  :: Xmpp.Jid
-                       , agent :: Ice.NiceAgent
-                       , stream :: Int
-                       }
+data IceUdpSession = IceUdpSession { ssid   :: Text
+                                   , peer  :: Xmpp.Jid
+                                   , agent :: Ice.NiceAgent
+                                   , stream :: Int
+                                   , sCreator :: Jingle.Creator
+                                   , cname :: Text
+                                   , sSenders :: Jingle.Senders
+                                   , we :: Xmpp.Jid
+                                   }
 
 data JingleIceError = JIUnpickleError UnpickleError
 
 randChars n = Text.take n . Text.decodeUtf8 . B64.encode . BS8.pack <$>
                            replicateM n randomIO
 
-sendSessionInitiate we to contentName sends desc sec session  cands lfrag passwd
+sendSessionInitiate we to contentName sends desc sec sidBytes
+                    session lfrag passwd cands _
     = do
-        sidBytes <- liftIO $ randChars 10
-        let iceUdp = IceUdp { pwd = passwd
-                            , ufrag = lfrag
+        let iceUdp = IceUdp { pwd = Just $ Text.pack passwd
+                            , ufrag = Just $ Text.pack lfrag
                             , candidates = Left cands
                             }
         let [NodeElement transportElement] = pickleTree xpTransport iceUdp
@@ -69,13 +74,13 @@ sendSessionInitiate we to contentName sends desc sec session  cands lfrag passwd
                                , Jingle.jinglePayload = []
                                }
         let [NodeElement el] = pickleTree Jingle.xpJingle ji
-        answer <- liftIO $ Xmpp.sendIQ' (Just to) Xmpp.Set Nothing el session
+        answer <- Xmpp.sendIQ' (Just to) Xmpp.Set Nothing el session
         check answer
         return ()
   where
-    check = undefined
+    check _ = return True -- undefined+
 
-type Handler = Xmpp.IQRequestTicket -> Jingle.Jingle -> Session -> IO ()
+type Handler = Xmpp.IQRequestTicket -> Jingle.Jingle -> IceUdpSession -> IO ()
 
 data ContentHandler = ContentHandler
    { handleContentAdd      :: Handler
@@ -85,38 +90,113 @@ data ContentHandler = ContentHandler
    , handleContentRemove   :: Handler
    , handleDescriptionInfo :: Handler
    , handleSessionInfo     :: Handler
+
+   , getContentDesc :: IO Element
    }
 
+
+-- startNewSession we jh ch hsi name senders desc remote session = do
+--     let sendData = sendSessionInitiate we remote name senders desc session
+--     startSession jh ch hsi sendData
+
+
+sendSessionAccept
+  :: Maybe Element
+     -> ContentHandler
+     -> Xmpp.Jid
+     -> Jingle.JingleHandler
+     -> String
+     -> String
+     -> [Candidate]
+     -> IceUdpSession
+     -> IO ()
+sendSessionAccept sec ch remote jh ufrag pwd cs session = do
+    contDesc <- getContentDesc ch
+    let iceUdp = IceUdp { pwd = Just $ Text.pack pwd
+                        , ufrag = Just $ Text.pack ufrag
+                        , candidates = Left cs
+                        }
+    let [NodeElement transportElement] = pickleTree xpTransport iceUdp
+    let cont = Jingle.JingleContent { Jingle.creator = sCreator session
+                                    , Jingle.disposition = Nothing -- stream
+                                    , Jingle.name = cname session
+                                    , Jingle.senders = Just $ sSenders session
+                                    , Jingle.contentDescription = Just contDesc
+                                    , Jingle.contentTransport =
+                                            Just transportElement
+                                    , Jingle.contentSecurity = sec
+                                    }
+
+    let ji = Jingle.Jingle { Jingle.action = Jingle.SessionAccept
+                           , Jingle.initiator = Just remote
+                           , Jingle.responder = Just $ we session
+                           , Jingle.sid = ssid session
+                           , Jingle.reason = Nothing
+                           , Jingle.content = [cont]
+                           , Jingle.jinglePayload = []
+                           }
+    let [NodeElement el] = pickleTree Jingle.xpJingle ji
+    _ <- liftIO $ Xmpp.sendIQ Nothing (Just remote) Xmpp.Set Nothing el
+         (Jingle.jingleXmppSession jh)
+    return ()
 
 
 -- sessionInitiate :: (String -> String -> [Candidate] -> IO a)
 --                 -> IO (String, String, [Candidate])
 --                 -> IO ()
-startSession jh ch handleSecurityInfo sendInitialData getRemoteData = do
+
+startSession
+  :: Jingle.JingleHandler
+     -> ContentHandler
+     -> (Xmpp.IQRequestTicket -> Jingle.Jingle -> IO ())
+     -> (String -> String -> [Candidate] -> IceUdpSession -> IO a)
+     -> (Jingle.MessageHandler -> IO ())
+     -> Text
+     -> Xmpp.Jid
+     -> Jingle.Creator
+     -> Text
+     -> Jingle.Senders
+     -> Xmpp.Jid
+     -> IO Jingle.MessageHandler
+startSession jh ch handleSecurityInfo sendInitialData registerSession sid' peer crea cname senders we = do
+    infoM "Pontarius.Xmpp.Jingle" "starting new session"
     glibTypeInit
     ctx <- mainContextNew
     ml <- mainLoopNew (Just ctx) False
     forkIO $ mainLoopRun ml
     agent <- Ice.niceAgentNew Ice.Rfc5245 ctx
     stream <- Ice.addStream agent 1
-    Ice.attachReceive agent stream 0 ctx (\_ -> return ())
-    Ice.gatherCandidates agent stream
+    Ice.attachReceive agent stream 1 ctx (\_ -> return ())
+    infoM "Pontarius.Xmpp.Jingle" "continuing session "
+    let sess = IceUdpSession { ssid = sid'
+                             , peer = peer
+                             , agent = agent
+                             , stream = stream
+                             , sCreator = crea
+                             , cname = cname
+                             , sSenders = senders
+                             , we = we
+                             }
+    registerSession (handleIncoming sess)
     on agent Ice.candidateGatheringDone $ \_ -> do
-        cs' <- Ice.getLocalCandidates agent stream 0
+        cs' <- Ice.getLocalCandidates agent stream 1
         let cs = zipWith (marshalCandidate stream) [1..] cs'
         (_, lufrag, lpwd) <- Ice.getLocalCredentials agent stream
-        sendInitialData lufrag lpwd cs
-        (ufrag, pwd, rcs) <- getRemoteData
-        Ice.setRemoteCredentials agent stream ufrag pwd
-        Ice.setRemoteCandidates agent stream 0 $ map (unmarshalCandidate stream )
-                                                     rcs
+        infoM "Pontarius.Xmpp.Jingle" $ show cs
+        sendInitialData lufrag lpwd cs sess
         return ()
-    let sess = Session { sid = undefined -- todo
-                       , peer = undefined -- todo
-                       , agent = agent
-                       , stream = stream
-                       }
-    let handleIncoming ticket ji = case Jingle.action ji of
+
+    on agent Ice.componentStateChanged $ \stream cid state -> do
+        debugM "Pontarius.Xmpp.Jingle" $ concat [ "Component state changed: "
+                          , "s=", show stream ,"; "
+                          , "c=", show cid    ,"; "
+                          , "state = ", show (toEnum (fromIntegral state)
+                                                :: Ice.ComponentState)
+                          ]
+    Ice.gatherCandidates agent stream
+    return $ handleIncoming sess
+  where
+    handleIncoming sess _ ticket ji = case Jingle.action ji of
                 Jingle.ContentAdd       -> handleContentAdd      ch ticket ji sess
                 Jingle.ContentAccept    -> handleContentAccept   ch ticket ji sess
                 Jingle.ContentModify    -> handleContentModify   ch ticket ji sess
@@ -132,25 +212,39 @@ startSession jh ch handleSecurityInfo sendInitialData getRemoteData = do
                 Jingle.TransportInfo    -> handleTransportInfo    ticket ji sess
                 Jingle.TransportReject  -> handleTransportReject  ticket sess
                 Jingle.TransportReplace -> handleTransportReplace ticket sess
-    return handleIncoming
-  where
     handleSessionAccept ticket ji sess = do
         case Jingle.content ji of
-            [Jingle.JingleContent { Jingle.contentDescription = Nothing
-                                  , Jingle.contentSecurity = Nothing
+            [Jingle.JingleContent { Jingle.contentDescription = _
+                                  , Jingle.contentSecurity = _
                                   , Jingle.contentTransport = Just te }] ->
                 do
                     case unpickle xpTransport [NodeElement te] of
-                        Left _ -> void $ errorBadRequest ticket
-                        Right IceUdp{candidates = Left [c]} -> do
-                            Ice.setRemoteCandidates (agent sess) (stream sess) 0
+                        Left e -> do
+                            errorM "Pontarius.Xmpp.Jingle" $
+                                "Error unpicking transport: " ++ ppUnpickleError e
+                            void $ errorBadRequest ticket
+                        Right IceUdp{candidates = Left [c]
+                                    , pwd        = Just pwd
+                                    , ufrag      = Just ufrag
+                                    } -> do
+                            debugM "Pontarius.Xmpp.Jingle"
+                                   "Setting remote credentials"
+                            Ice.setRemoteCredentials (agent sess)  (stream sess)
+                                                     (Text.unpack ufrag)
+                                                     (Text.unpack pwd)
+                            debugM "Pontarius.Xmpp.Jingle"
+                                   "Setting new candidates from session-accept"
+                            Ice.setRemoteCandidates (agent sess) (stream sess) 1
                                                     [unmarshalCandidate 0 c]
                             Xmpp.answerIQ ticket (Right Nothing)
                             return ()
-            _ -> void $ errorBadRequest ticket
+            _ -> do
+                errorM "Pontarius.Xmpp.Jingle" $ "Unexpected jingle content:"
+                                                 ++ show (Jingle.content ji)
+                void $ errorBadRequest ticket
     handleSessionTerminate ticket sess = do
         Xmpp.answerIQ ticket (Right Nothing)
-        endSession (sid sess) jh
+        endSession (ssid sess) jh
     handleTransportAccept ticket  = errorBadRequest ticket -- Assuming that we
                                                            -- never send
                                                            -- transport-replace.
@@ -160,8 +254,10 @@ startSession jh ch handleSecurityInfo sendInitialData getRemoteData = do
                 do
                     case unpickle xpTransport [NodeElement te] of
                         Left _ -> void $ errorBadRequest ticket
-                        Right IceUdp{candidates = Left cs} -> do
+                        Right IceUdp{ candidates = Left cs } -> do
                             handleContentAccept ch ticket ji sess --Is this right?
+                            debugM "Pontarius.Xmpp.Jingle"
+                                "Setting new candidates from transport-info"
                             Ice.setRemoteCandidates (agent sess) (stream sess) 0
                                                     (map (unmarshalCandidate 0) cs)
                             Xmpp.answerIQ ticket (Right Nothing)
@@ -169,7 +265,7 @@ startSession jh ch handleSecurityInfo sendInitialData getRemoteData = do
             _ -> void $ errorBadRequest ticket
     handleTransportReject ticket session = do
         Xmpp.answerIQ ticket (Right Nothing)
-        terminateSession (sid session) jh
+        terminateSession (ssid session) jh
                          Jingle.JingleReason { Jingle.reasonType = Jingle.FailedTransport
                                              , Jingle.reasonText = Nothing
                                              , Jingle.reasonElement = Nothing
@@ -179,7 +275,7 @@ startSession jh ch handleSecurityInfo sendInitialData getRemoteData = do
         let remote = Xmpp.iqRequestFrom $ Xmpp.iqRequestBody ticket
         case remote of
             Nothing -> return ()
-            Just r -> transportReject (sid sess) r (Jingle.jingleXmppSession jh)
+            Just r -> transportReject (ssid sess) r (Jingle.jingleXmppSession jh)
     port (SockAddrInet p _) = p
     port (SockAddrInet6 p _ _ _) = p
     port _ = error "port on IPC socket"
@@ -251,7 +347,7 @@ xpCandidates = xpWrap (map from) (map to) $
                         (xpAttribute "component"  xpPrim)
                         (xpAttribute "foundation" xpText)
                         (xpAttribute "generation" xpPrim)
-                        (xpAttribute "id"         xpPrim)
+                        (xpAttribute "id"         xpText)
                         (xpAttribute "network"    xpPrim)
                         xpAddress)
                     (xp4Tuple

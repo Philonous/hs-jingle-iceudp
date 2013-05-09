@@ -34,3 +34,6 @@ library
                      , base64-bytestring
                      , bytestring
                      , mtl
+                     , hslogger
+                     , containers
+                     , data-default
