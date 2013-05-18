@@ -54,7 +54,7 @@ sendSessionInitiate we to contentName sends desc sec sidBytes
                             , ufrag = Just $ Text.pack lfrag
                             , candidates = Left cands
                             }
-        let [NodeElement transportElement] = pickleTree xpTransport iceUdp
+        let [NodeElement transportElement] = pickleTree xpIceUdp iceUdp
         let cont = Jingle.JingleContent { Jingle.creator = Jingle.CInitiator
                                         , Jingle.disposition = Nothing -- stream
                                         , Jingle.name = contentName
@@ -116,7 +116,7 @@ sendSessionAccept sec ch remote jh ufrag pwd cs session = do
                         , ufrag = Just $ Text.pack ufrag
                         , candidates = Left cs
                         }
-    let [NodeElement transportElement] = pickleTree xpTransport iceUdp
+    let [NodeElement transportElement] = pickleTree xpIceUdp iceUdp
     let cont = Jingle.JingleContent { Jingle.creator = sCreator session
                                     , Jingle.disposition = Nothing -- stream
                                     , Jingle.name = cname session
@@ -145,20 +145,20 @@ sendSessionAccept sec ch remote jh ufrag pwd cs session = do
 --                 -> IO (String, String, [Candidate])
 --                 -> IO ()
 
-startSession
-  :: Jingle.JingleHandler
-     -> ContentHandler
-     -> (Xmpp.IQRequestTicket -> Jingle.Jingle -> IO ())
-     -> (String -> String -> [Candidate] -> IceUdpSession -> IO a)
-     -> (Jingle.MessageHandler -> IO ())
-     -> Text
-     -> Xmpp.Jid
-     -> Jingle.Creator
-     -> Text
-     -> Jingle.Senders
-     -> Xmpp.Jid
-     -> IO Jingle.MessageHandler
-startSession jh ch handleSecurityInfo sendInitialData registerSession sid' peer crea cname senders we = do
+-- startSession
+--   :: Jingle.JingleHandler
+--      -> ContentHandler
+--      -> (Xmpp.IQRequestTicket -> Jingle.Jingle -> IO ())
+--      -> (String -> String -> [Candidate] -> IceUdpSession -> IO a)
+--      -> (Jingle.MessageHandler -> IO ())
+--      -> Text
+--      -> Xmpp.Jid
+--      -> Jingle.Creator
+--      -> Text
+--      -> Jingle.Senders
+--      -> Xmpp.Jid
+--      -> IO Jingle.MessageHandler
+startSession jh ch handleSecurityInfo sendInitialData registerSession remoteData sid' peer crea cname senders we = do
     infoM "Pontarius.Xmpp.Jingle" "starting new session"
     glibTypeInit
     ctx <- mainContextNew
@@ -166,7 +166,7 @@ startSession jh ch handleSecurityInfo sendInitialData registerSession sid' peer 
     forkIO $ mainLoopRun ml
     agent <- Ice.niceAgentNew Ice.Rfc5245 ctx
     stream <- Ice.addStream agent 1
-    Ice.attachReceive agent stream 1 ctx (\_ -> return ())
+    Ice.attachReceive agent stream 1 ctx (BS8.putStrLn)
     infoM "Pontarius.Xmpp.Jingle" "continuing session "
     let sess = IceUdpSession { ssid = sid'
                              , peer = peer
@@ -179,6 +179,20 @@ startSession jh ch handleSecurityInfo sendInitialData registerSession sid' peer 
                              }
     registerSession (handleIncoming sess)
     on agent Ice.candidateGatheringDone $ \_ -> do
+        case remoteData of
+            Nothing -> return ()
+            Just cd@(ufrag, pwd, cs) -> do
+                debugM "Pontarius.Xmpp.Jingle" "Setting remote credentials"
+                debugM "Pontarius.Xmpp.Jingle"  $ show cd
+                Ice.setRemoteCredentials agent stream
+                                (Text.unpack ufrag) (Text.unpack pwd)
+                debugM "Pontarius.Xmpp.Jingle" "Setting new candidates"
+                Ice.setRemoteCandidates agent stream 1
+                                        (map (unmarshalCandidate stream) cs)
+                debugM "Pontarius.Xmpp.Jingle" "Candidates set"
+                return ()
+
+
         cs' <- Ice.getLocalCandidates agent stream 1
         let cs = zipWith (marshalCandidate stream) [1..] cs'
         (_, lufrag, lpwd) <- Ice.getLocalCredentials agent stream
@@ -186,13 +200,15 @@ startSession jh ch handleSecurityInfo sendInitialData registerSession sid' peer 
         sendInitialData lufrag lpwd cs sess
         return ()
 
-    on agent Ice.componentStateChanged $ \stream cid state -> do
+    on agent Ice.componentStateChanged $ \stream cid state' -> do
+        let state = toEnum $ fromIntegral state' :: Ice.ComponentState
         debugM "Pontarius.Xmpp.Jingle" $ concat [ "Component state changed: "
                           , "s=", show stream ,"; "
                           , "c=", show cid    ,"; "
-                          , "state = ", show (toEnum (fromIntegral state)
-                                                :: Ice.ComponentState)
+                          , "state = ", show state
                           ]
+        when (state == Ice.StateReady) . void $ Ice.send agent
+              (fromIntegral stream) 1 "HELLO"
     Ice.gatherCandidates agent stream
     return $ handleIncoming sess
   where
@@ -218,7 +234,7 @@ startSession jh ch handleSecurityInfo sendInitialData registerSession sid' peer 
                                   , Jingle.contentSecurity = _
                                   , Jingle.contentTransport = Just te }] ->
                 do
-                    case unpickle xpTransport [NodeElement te] of
+                    case unpickle xpIceUdp [NodeElement te] of
                         Left e -> do
                             errorM "Pontarius.Xmpp.Jingle" $
                                 "Error unpicking transport: " ++ ppUnpickleError e
@@ -235,7 +251,7 @@ startSession jh ch handleSecurityInfo sendInitialData registerSession sid' peer 
                             debugM "Pontarius.Xmpp.Jingle"
                                    "Setting new candidates from session-accept"
                             Ice.setRemoteCandidates (agent sess) (stream sess) 1
-                                                    [unmarshalCandidate 0 c]
+                                                    [unmarshalCandidate (stream sess) c]
                             Xmpp.answerIQ ticket (Right Nothing)
                             return ()
             _ -> do
@@ -252,7 +268,7 @@ startSession jh ch handleSecurityInfo sendInitialData registerSession sid' peer 
         case Jingle.content ji of
             [Jingle.JingleContent {Jingle.contentTransport = Just te }] ->
                 do
-                    case unpickle xpTransport [NodeElement te] of
+                    case unpickle xpIceUdp [NodeElement te] of
                         Left _ -> void $ errorBadRequest ticket
                         Right IceUdp{ candidates = Left cs } -> do
                             handleContentAccept ch ticket ji sess --Is this right?
@@ -328,8 +344,8 @@ iceUdpNs = "urn:xmpp:jingle:transports:ice-udp:1"
 iceUdpName :: Text -> Name
 iceUdpName n = Name n (Just iceUdpNs) Nothing
 
-xpTransport :: PU [Node] IceUdp
-xpTransport = xpWrap (\((u, p), c) -> IceUdp u p c)
+xpIceUdp :: PU [Node] IceUdp
+xpIceUdp = xpWrap (\((u, p), c) -> IceUdp u p c)
                      (\(IceUdp u p c) -> ((u, p), c)) $
                 xpElem (iceUdpName "transport")
                     (xp2Tuple

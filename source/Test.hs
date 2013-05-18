@@ -16,6 +16,7 @@ import           Network.Xmpp.IM
 import qualified Network.Xmpp.Xep.Jingle as Jingle
 import qualified Network.Xmpp.Xep.Jingle.Types as Jingle
 import qualified Network.Xmpp.Xep.Jingle.IceUdp as Jingle
+import qualified Network.Xmpp.Xep.Jingle.IceUdp.Types as Jingle
 import qualified Network.Xmpp.Xep.Jingle.Picklers as Jingle
 import           System.Log.Handler hiding (setLevel)
 import           System.Log.Handler.Simple
@@ -33,13 +34,13 @@ config = def{Xmpp.sessionStreamConfiguration
 -- | Automatically accept all subscription requests from other entities
 autoAccept :: Xmpp.Session -> IO ()
 autoAccept session = forever $ do
-  st <- Xmpp.waitForPresence (\x -> Xmpp.presenceType x == Just Xmpp.Subscribe) session
-  friend <- case Xmpp.presenceFrom st of
-      Just from -> do
-          Xmpp.sendPresence (Xmpp.presenceSubscribed from) session
-          return $ show from
-      Nothing -> return "anonymous" -- this shouldn't happen
-  putStrLn $  "Accepted " ++ show friend
+    st <- Xmpp.waitForPresence (\x -> Xmpp.presenceType x == Just Xmpp.Subscribe) session
+    friend <- case Xmpp.presenceFrom st of
+        Just from -> do
+            Xmpp.sendPresence (Xmpp.presenceSubscribed from) session
+            return $ show from
+        Nothing -> return "anonymous" -- this shouldn't happen
+    putStrLn $  "Accepted " ++ show friend
 
 
 -- type HandlerFunc = Xmpp.Jid
@@ -48,6 +49,30 @@ autoAccept session = forever $ do
 --                    -> TChan Jingle
 --                    -> JingleHandler
 --                    -> IO (Maybe MessageHandler)
+
+newSession jh to sessionName xmppSession = do
+    Just we <- Xmpp.getJid xmppSession
+    let hsi ticket _ = Jingle.errorBadRequest ticket
+    sid <- Jingle.randChars 8
+    let registerSession hi = do
+        debugM "Pontarius.Xmpp.Jingle" $ "Adding Session: " ++ Text.unpack sid
+        sState <- newTVarIO Jingle.PENDING
+        let jSession = Jingle.Session { Jingle.sState  = sState
+                                      , Jingle.sSid    = sid
+                                      , Jingle.sRemote = to
+                                      , Jingle.sRequests = hi
+                                      }
+        Jingle.addSession jSession jh
+        return ()
+    handler <- Jingle.startSession jh (myContentHandler dummyE) hsi
+                                   ( Jingle.sendSessionInitiate we to
+                                         sessionName (Just Jingle.SBoth)
+                                         dummyE Nothing sid xmppSession
+                                   )
+                                   registerSession Nothing
+                                   sid to Jingle.CInitiator sessionName
+                                   Jingle.SBoth we
+    return ()
 
 -- handleNewRequest
 --   :: Xmpp.Jid
@@ -61,10 +86,19 @@ autoAccept session = forever $ do
 --      -> IO (Maybe Jingle.MessageHandler)
 handleNewRequest we ch hsi remote ji st jis jh = do
     case Jingle.content ji of
-        [jco] -> do
+        [jco@Jingle.JingleContent { Jingle.contentDescription = _
+                                  , Jingle.contentSecurity = _
+                                  , Jingle.contentTransport =  Just te
+                                  }] -> do
             let ch' = myContentHandler . fromJust $ Jingle.contentDescription jco
-            let sendInitD = Jingle.sendSessionAccept Nothing ch' remote jh
-            handler <- Jingle.startSession jh ch' hsi sendInitD (\_ -> return ())
+                sendInitD = Jingle.sendSessionAccept Nothing ch' remote jh
+                Right Jingle.IceUdp { Jingle.ufrag = Just uf
+                                    , Jingle.pwd = Just pw
+                                    , Jingle.candidates = Left cs}
+                    = unpickle Jingle.xpIceUdp [NodeElement te]
+                remoteData = (uf, pw, cs)
+            handler <- Jingle.startSession jh ch' hsi sendInitD
+                                           (\_ -> return ()) (Just remoteData)
                                            (Jingle.sid ji) remote
                                            (Jingle.creator jco) (Jingle.name jco)
                                            (fromJust $ Jingle.senders jco) we
@@ -76,6 +110,7 @@ handleNewRequest we ch hsi remote ji st jis jh = do
             Xmpp.sendIQ Nothing (Just remote) Xmpp.Set Nothing termEl
                         (Jingle.jingleXmppSession jh)
             return Nothing
+
 
 
 myContentHandler desc = Jingle.ContentHandler
@@ -92,34 +127,9 @@ myContentHandler desc = Jingle.ContentHandler
     br ticket _ _ = Jingle.errorBadRequest ticket
     answer ticket _ _ = Xmpp.answerIQ ticket (Right Nothing) >> return ()
 
-newSession jh to xmppSession = do
-    Just we <- Xmpp.getJid xmppSession
-    let hsi ticket _ = Jingle.errorBadRequest ticket
-    sid <- Jingle.randChars 8
-    let registerSession hi = do
-        debugM "Pontarius.Xmpp.Jingle" $ "Adding Session: " ++ Text.unpack sid
-        sState <- newTVarIO Jingle.PENDING
-        let jSession = Jingle.Session { Jingle.sState  = sState
-                                      , Jingle.sSid    = sid
-                                      , Jingle.sRemote = to
-                                      , Jingle.sRequests = hi
-                                      }
-        Jingle.addSession jSession jh
-        return ()
-    handler <- Jingle.startSession jh (myContentHandler dummyE) hsi
-                                   ( Jingle.sendSessionInitiate we to
-                                         "test-session" (Just Jingle.SBoth)
-                                         dummyE Nothing sid xmppSession
-                                   )
-                                   registerSession
-                                   sid to Jingle.CInitiator "test-session"
-                                   Jingle.SBoth we
-
-    return ()
-
 main' active uname = do
-    updateGlobalLogger "Pontarius.Xmpp" $ setLevel DEBUG
-    updateGlobalLogger "Pontarius.Xmpp.Jingle" $ setLevel DEBUG
+    updateGlobalLogger "Pontarius.Xmpp" $ setLevel INFO
+    updateGlobalLogger "Pontarius.Xmpp.Jingle" $ setLevel INFO
     sess' <- Xmpp.session realm
                      (Just ([Xmpp.scramSha1 uname Nothing password], resource))
                      config
@@ -147,7 +157,7 @@ main' active uname = do
         -- Xmpp.sendIQ Nothing (Just "echo2@species64739.dyndns.org/bot")
         --             Xmpp.Set Nothing dummyE  sess
         threadDelay 1000000
-        newSession jh (read "echo2@species64739.dyndns.org/bot") sess
+        newSession jh (read "echo2@species64739.dyndns.org/bot") "test-session" sess
         return ()
     forever $ threadDelay 10000000
     return sess
